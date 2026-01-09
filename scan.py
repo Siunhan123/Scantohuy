@@ -27,6 +27,10 @@ TIMEFRAMES = [
     {"tf": "1d", "cooldown_hours": 48},
 ]
 
+# Báo cáo mỗi lần chạy: gửi top N mã (tránh quá dài)
+REPORT_TOP_N_US = 60
+REPORT_TOP_N_VN = 60
+
 SESSION = requests.Session()
 SESSION.headers.update({
     "user-agent": "Mozilla/5.0",
@@ -56,17 +60,35 @@ def save_state(state: Dict[str, Any]) -> None:
 # ---------------------------
 # Telegram
 # ---------------------------
-def send_telegram(text: str) -> None:
+def send_telegram(text: str, disable_preview: bool = True) -> None:
+    """
+    Gửi 1 message Telegram. Không raise để tránh job fail.
+    """
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     chat_id = os.environ["TELEGRAM_CHAT_ID"]
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     r = SESSION.post(url, json={
         "chat_id": chat_id,
         "text": text,
-        "disable_web_page_preview": False
+        "disable_web_page_preview": disable_preview
     }, timeout=30)
     if r.status_code >= 400:
-        print("Telegram error:", r.status_code, r.text[:200])
+        print("Telegram error:", r.status_code, r.text[:300])
+
+
+def send_telegram_chunked(text: str, chunk_size: int = 3500) -> None:
+    """
+    Telegram giới hạn ~4096 ký tự/tin, nên chia nhỏ để an toàn.
+    """
+    if len(text) <= chunk_size:
+        send_telegram(text)
+        return
+
+    start = 0
+    while start < len(text):
+        end = min(start + chunk_size, len(text))
+        send_telegram(text[start:end])
+        start = end
 
 
 # ---------------------------
@@ -167,7 +189,6 @@ def yahoo_h1(symbol: str, range_: str = "60d", max_retries: int = 5) -> Optional
             df = pd.DataFrame(data, columns=["ts", "close"])
             df["close"] = pd.to_numeric(df["close"], errors="coerce").astype(float)
             df = df.dropna(subset=["close"])
-
             if len(df) < 60:
                 return None
 
@@ -182,7 +203,7 @@ def yahoo_h1(symbol: str, range_: str = "60d", max_retries: int = 5) -> Optional
 
 
 # ---------------------------
-# Indicators (force float, avoid pd.NA -> object)
+# Indicators (force float)
 # ---------------------------
 def rsi(series: pd.Series, length: int = 14) -> pd.Series:
     s = pd.to_numeric(series, errors="coerce").astype(float)
@@ -194,7 +215,6 @@ def rsi(series: pd.Series, length: int = 14) -> pd.Series:
     roll_up = up.ewm(alpha=1/length, adjust=False).mean()
     roll_down = down.ewm(alpha=1/length, adjust=False).mean()
 
-    # IMPORTANT: use np.nan to keep float dtype
     roll_down = roll_down.replace(0.0, np.nan)
 
     rs = roll_up / roll_down
@@ -274,10 +294,15 @@ def main():
     try:
         us, vn = get_candidates_tradingview()
     except Exception:
-        print("TradingView query failed:")
-        print(traceback.format_exc())
+        # Nếu TradingView fail, vẫn gửi report để bạn biết bot chạy nhưng không lấy được list
+        err = traceback.format_exc()
+        send_telegram_chunked("❌ TradingView query failed:\n" + err[:3000])
         save_state(state)
         return
+
+    # Danh sách mã lọc ra để report
+    us_list = [f"{x.get('exchange','')}:{x.get('name','')}" for x in us if x.get("name")]
+    vn_list = [f"{x.get('exchange','')}:{x.get('name','')}" for x in vn if x.get("name")]
 
     rows = [("US", r) for r in us] + [("VN", r) for r in vn]
     print(f"Candidates: US={len(us)} VN={len(vn)} total={len(rows)}")
@@ -320,6 +345,7 @@ def main():
                     f"- {tf.upper()}: RSI {out['rsi']:.2f} cắt lên EMA {out['ema']:.2f} (bar {out['bar_time']})"
                 )
 
+        # Gửi tín hiệu (nếu có)
         if tf_msgs:
             hits += 1
             msg = (
@@ -328,7 +354,23 @@ def main():
                 + "\n".join(tf_msgs) + "\n"
                 f"https://finance.yahoo.com/quote/{yahoo_sym}"
             )
-            send_telegram(msg)
+            send_telegram(msg, disable_preview=True)
+
+    # ====== ALWAYS SEND REPORT (kể cả không có tín hiệu) ======
+    run_time_utc = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+    report_lines = [
+        f"🧾 Scan report (hourly) @ {run_time_utc} UTC",
+        f"- Candidates: US={len(us_list)} | VN={len(vn_list)}",
+        f"- Processed (Yahoo OK): {processed}",
+        f"- Signals: {hits}",
+        "",
+        "🇺🇸 US list (top):",
+        ", ".join(us_list[:REPORT_TOP_N_US]) if us_list else "(none)",
+        "",
+        "🇻🇳 VN list (top):",
+        ", ".join(vn_list[:REPORT_TOP_N_VN]) if vn_list else "(none)",
+    ]
+    send_telegram_chunked("\n".join(report_lines))
 
     save_state(state)
     print(f"Done. processed={processed} signals={hits}")
@@ -339,9 +381,13 @@ if __name__ == "__main__":
         main()
     except Exception:
         # tuyệt đối không làm job chết vì 1 lỗi bất ngờ
-        print("Fatal error:")
-        print(traceback.format_exc())
-        # vẫn cố lưu state (nếu có)
+        err = traceback.format_exc()
+        print("Fatal error:\n", err)
+        # vẫn cố gửi 1 tin để bạn biết có lỗi
+        try:
+            send_telegram_chunked("❌ Fatal error in scan.py:\n" + err[:3000])
+        except Exception:
+            pass
         try:
             save_state(load_state())
         except Exception:
