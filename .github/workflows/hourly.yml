@@ -1,0 +1,39 @@
+name: hourly-scan
+
+on:
+  schedule:
+    - cron: "7 * * * *"   # chạy mỗi giờ (theo UTC)
+  workflow_dispatch:       # cho phép bấm chạy thử bằng tay
+
+permissions:
+  contents: write          # để workflow có quyền commit state.json
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scanner
+        run: python scan.py
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+      - name: Save state (commit back to repo)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          git commit -m "Update state" || echo "No changes"
+          git push
