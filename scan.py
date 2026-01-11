@@ -21,11 +21,21 @@ MAX_CANDIDATES_VN = 40
 
 SLEEP_BETWEEN_SYMBOLS = 0.5  # seconds
 
+# Timeframes scanned
 TIMEFRAMES = [
     {"tf": "1h", "cooldown_hours": 6},
     {"tf": "4h", "cooldown_hours": 12},
     {"tf": "1d", "cooldown_hours": 48},
 ]
+
+# Range (more history => RSI/EMA match better)
+RANGE_1H = "180d"  # You can set "730d" if you want max warmup (heavier)
+RANGE_1D = "5y"
+
+# Match TradingView "Extended hours" toggle:
+# - If you use TradingView with Extended Hours OFF for stocks, set False.
+# - If ON, set True (may change results).
+INCLUDE_PREPOST = False
 
 # Báo cáo mỗi lần chạy: gửi top N mã (tránh quá dài)
 REPORT_TOP_N_US = 60
@@ -37,6 +47,25 @@ SESSION.headers.update({
     "accept": "application/json,text/plain,*/*",
 })
 
+# ====== EXTRA MANUAL SYMBOLS (always check) ======
+# You asked: OANDA:XAUUSD and BITSTAMP:BTCUSDT
+# We still fetch candles from Yahoo, so we map to Yahoo symbols with fallback list.
+EXTRA_SYMBOLS = [
+    {
+        "market": "EXTRA",
+        "exchange": "OANDA",
+        "name": "XAUUSD",
+        "label": "XAUUSD (OANDA)",
+        "yahoo_try": ["XAUUSD=X", "GC=F"],  # spot then futures fallback
+    },
+    {
+        "market": "EXTRA",
+        "exchange": "BITSTAMP",
+        "name": "BTCUSDT",
+        "label": "BTCUSDT (Bitstamp)",
+        "yahoo_try": ["BTC-USDT", "BTC-USD"],  # try USDT pair, fallback to BTC-USD
+    },
+]
 
 # ---------------------------
 # State handling (robust)
@@ -146,21 +175,48 @@ def get_candidates_tradingview() -> Tuple[List[Dict[str, Any]], List[Dict[str, A
     return us, vn
 
 
+# ---------------------------
+# Yahoo symbol mapping
+# ---------------------------
 def tv_to_yahoo_symbol(exchange: str, ticker: str) -> str:
+    # Stocks VN
     if exchange in ["HOSE", "HNX", "UPCOM"]:
         return f"{ticker}.VN"
+    # Default US stock
     return ticker
+
+
+def resolve_yahoo_try_list(market: str, exchange: str, ticker: str) -> List[str]:
+    """
+    Return a list of Yahoo symbols to try (fallback supported).
+    """
+    # Manual extras
+    if market == "EXTRA":
+        for it in EXTRA_SYMBOLS:
+            if it["exchange"] == exchange and it["name"] == ticker:
+                return it.get("yahoo_try", [])
+
+    # Normal stocks: single yahoo symbol
+    return [tv_to_yahoo_symbol(exchange, ticker)]
 
 
 # ---------------------------
 # Yahoo Finance chart (retry/backoff + numeric clean)
 # ---------------------------
-def yahoo_h1(symbol: str, range_: str = "60d", max_retries: int = 5) -> Optional[Tuple[pd.DataFrame, str]]:
+def yahoo_chart(symbol: str, interval: str, range_: str, include_prepost: bool, max_retries: int = 5) -> Optional[Tuple[pd.DataFrame, str]]:
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 
     for attempt in range(max_retries):
         try:
-            r = SESSION.get(url, params={"range": range_, "interval": "1h"}, timeout=30)
+            r = SESSION.get(
+                url,
+                params={
+                    "range": range_,
+                    "interval": interval,
+                    "includePrePost": "true" if include_prepost else "false",
+                },
+                timeout=30
+            )
 
             if r.status_code == 429:
                 wait = (2 ** attempt) + random.uniform(0.0, 1.0)
@@ -179,7 +235,7 @@ def yahoo_h1(symbol: str, range_: str = "60d", max_retries: int = 5) -> Optional
             tz = meta.get("timezone", "UTC")
 
             ts = res.get("timestamp", [])
-            quote = res["indicators"]["quote"][0]
+            quote = res.get("indicators", {}).get("quote", [{}])[0]
             close = quote.get("close", [])
 
             data = [(t, c) for t, c in zip(ts, close) if c is not None]
@@ -202,23 +258,42 @@ def yahoo_h1(symbol: str, range_: str = "60d", max_retries: int = 5) -> Optional
     return None
 
 
+def yahoo_fetch_with_fallback(symbols_to_try: List[str], interval: str, range_: str, include_prepost: bool) -> Optional[Tuple[pd.DataFrame, str, str]]:
+    """
+    Try multiple Yahoo tickers until one works.
+    Returns (df, tz, used_symbol)
+    """
+    for sym in symbols_to_try:
+        out = yahoo_chart(sym, interval=interval, range_=range_, include_prepost=include_prepost)
+        if out is not None:
+            df, tz = out
+            return df, tz, sym
+    return None
+
+
 # ---------------------------
-# Indicators (force float)
+# Indicators (closer to TradingView)
 # ---------------------------
 def rsi(series: pd.Series, length: int = 14) -> pd.Series:
+    """
+    Wilder RSI: close to TradingView ta.rsi.
+    Handle extremes (avgLoss=0 => RSI=100, avgGain=0 => RSI=0) to avoid NaN drift.
+    """
     s = pd.to_numeric(series, errors="coerce").astype(float)
     delta = s.diff()
 
     up = delta.clip(lower=0.0)
     down = (-delta).clip(lower=0.0)
 
-    roll_up = up.ewm(alpha=1/length, adjust=False).mean()
-    roll_down = down.ewm(alpha=1/length, adjust=False).mean()
+    avg_gain = up.ewm(alpha=1/length, adjust=False).mean()
+    avg_loss = down.ewm(alpha=1/length, adjust=False).mean()
 
-    roll_down = roll_down.replace(0.0, np.nan)
-
-    rs = roll_up / roll_down
+    rs = avg_gain / avg_loss
     out = 100.0 - (100.0 / (1.0 + rs))
+
+    # match TV behavior on extremes
+    out = out.where(avg_loss != 0, 100.0)
+    out = out.where(avg_gain != 0, 0.0)
     return out
 
 
@@ -227,40 +302,51 @@ def ema(series: pd.Series, length: int = 9) -> pd.Series:
     return s.ewm(span=length, adjust=False).mean()
 
 
-def resample_close(df_h1: pd.DataFrame, tf: str) -> pd.Series:
-    s = pd.to_numeric(df_h1["close"], errors="coerce").astype(float).dropna()
-    if tf == "1h":
-        return s
-    if tf == "4h":
-        return s.resample("4H").last().dropna().astype(float)
-    if tf == "1d":
-        return s.resample("1D").last().dropna().astype(float)
-    raise ValueError("Unsupported timeframe")
+# ---------------------------
+# Timeframe helpers
+# ---------------------------
+def resample_4h_from_1h(close_1h: pd.Series) -> pd.Series:
+    s = pd.to_numeric(close_1h, errors="coerce").astype(float).dropna()
+    # "right/right" makes close at the bar end more consistent
+    return s.resample("4H", label="right", closed="right").last().dropna().astype(float)
 
 
 def compute_cross(close: pd.Series) -> Optional[Dict[str, Any]]:
     close = pd.to_numeric(close, errors="coerce").astype(float).dropna()
-    if len(close) < (RSI_LEN + EMA_LEN + 10):
+
+    # warmup: need more than just 14/9 to converge
+    min_len = max(200, (RSI_LEN + EMA_LEN + 50))
+    if len(close) < min_len:
         return None
 
     r = rsi(close, RSI_LEN)
     e = ema(r, EMA_LEN)
 
-    # last closed bar is -2 (avoid forming bar)
-    if len(r.dropna()) < 5 or len(e.dropna()) < 5:
+    r = r.dropna()
+    e = e.dropna()
+    if len(r) < 10 or len(e) < 10:
+        return None
+
+    # last closed bar = -2 (avoid forming bar)
+    if len(close) < 3:
         return None
 
     r_prev, r_now = r.iloc[-3], r.iloc[-2]
     e_prev, e_now = e.iloc[-3], e.iloc[-2]
+
     if np.isnan(r_prev) or np.isnan(r_now) or np.isnan(e_prev) or np.isnan(e_now):
         return None
 
     crossed_up = (r_prev <= e_prev) and (r_now > e_now)
+
+    # bar time taken from close index (-2)
+    bar_time = str(close.index[-2])
+
     return {
         "crossed_up": bool(crossed_up),
         "rsi": float(r_now),
         "ema": float(e_now),
-        "bar_time": str(close.index[-2]),
+        "bar_time": bar_time,
     }
 
 
@@ -294,18 +380,33 @@ def main():
     try:
         us, vn = get_candidates_tradingview()
     except Exception:
-        # Nếu TradingView fail, vẫn gửi report để bạn biết bot chạy nhưng không lấy được list
         err = traceback.format_exc()
         send_telegram_chunked("❌ TradingView query failed:\n" + err[:3000])
         save_state(state)
         return
 
-    # Danh sách mã lọc ra để report
+    # Append manual symbols (avoid duplicates)
+    existing = set()
+    for r in us:
+        if r.get("exchange") and r.get("name"):
+            existing.add(("US", r["exchange"], r["name"]))
+    for r in vn:
+        if r.get("exchange") and r.get("name"):
+            existing.add(("VN", r["exchange"], r["name"]))
+
+    extras_records = []
+    for it in EXTRA_SYMBOLS:
+        tup = (it["market"], it["exchange"], it["name"])
+        if tup not in existing:
+            extras_records.append({"exchange": it["exchange"], "name": it["name"], "close": None, "volume": None, "label": it.get("label")})
+
+    # Build report lists
     us_list = [f"{x.get('exchange','')}:{x.get('name','')}" for x in us if x.get("name")]
     vn_list = [f"{x.get('exchange','')}:{x.get('name','')}" for x in vn if x.get("name")]
+    extra_list = [f"{x.get('exchange','')}:{x.get('name','')}" for x in extras_records if x.get("name")]
 
-    rows = [("US", r) for r in us] + [("VN", r) for r in vn]
-    print(f"Candidates: US={len(us)} VN={len(vn)} total={len(rows)}")
+    rows = [("US", r) for r in us] + [("VN", r) for r in vn] + [("EXTRA", r) for r in extras_records]
+    print(f"Candidates: US={len(us)} VN={len(vn)} EXTRA={len(extras_records)} total={len(rows)}")
 
     hits = 0
     processed = 0
@@ -313,46 +414,100 @@ def main():
     for market, r in rows:
         ticker = r.get("name")
         exchange = r.get("exchange", "")
+        label = r.get("label") or f"{exchange}:{ticker}"
+
         if not ticker:
             continue
 
-        yahoo_sym = tv_to_yahoo_symbol(exchange, ticker)
         key = f"{market}:{exchange}:{ticker}"
-
         time.sleep(SLEEP_BETWEEN_SYMBOLS)
 
-        data = yahoo_h1(yahoo_sym)
-        if data is None:
+        # Decide needed data per TF:
+        need_1h = any(x["tf"] in ("1h", "4h") for x in TIMEFRAMES)
+        need_1d = any(x["tf"] == "1d" for x in TIMEFRAMES)
+
+        yahoo_try = resolve_yahoo_try_list(market, exchange, ticker)
+
+        df_1h = None
+        used_sym_1h = None
+        tz_1h = None
+
+        df_1d = None
+        used_sym_1d = None
+        tz_1d = None
+
+        # fetch 1H (for 1H + 4H)
+        if need_1h:
+            out = yahoo_fetch_with_fallback(yahoo_try, interval="1h", range_=RANGE_1H, include_prepost=INCLUDE_PREPOST)
+            if out is not None:
+                df_1h, tz_1h, used_sym_1h = out
+
+        # fetch 1D (native daily, better match TV daily)
+        if need_1d:
+            out = yahoo_fetch_with_fallback(yahoo_try, interval="1d", range_=RANGE_1D, include_prepost=INCLUDE_PREPOST)
+            if out is not None:
+                df_1d, tz_1d, used_sym_1d = out
+
+        if df_1h is None and df_1d is None:
             continue
 
-        df_h1, _tz = data
         processed += 1
 
         tf_msgs = []
         for tf_cfg in TIMEFRAMES:
             tf = tf_cfg["tf"]
 
-            close_tf = resample_close(df_h1, tf)
-            out = compute_cross(close_tf)
-            if not out:
-                continue
+            try:
+                if tf == "1h":
+                    if df_1h is None:
+                        continue
+                    close_tf = pd.to_numeric(df_1h["close"], errors="coerce").astype(float).dropna()
 
-            if not should_process_new_bar(state, key, tf, out["bar_time"]):
-                continue
+                elif tf == "4h":
+                    if df_1h is None:
+                        continue
+                    close_1h = pd.to_numeric(df_1h["close"], errors="coerce").astype(float).dropna()
+                    close_tf = resample_4h_from_1h(close_1h)
 
-            if out["crossed_up"] and can_alert(state, key, tf, tf_cfg["cooldown_hours"], now_ts):
-                tf_msgs.append(
-                    f"- {tf.upper()}: RSI {out['rsi']:.2f} cắt lên EMA {out['ema']:.2f} (bar {out['bar_time']})"
-                )
+                elif tf == "1d":
+                    if df_1d is None:
+                        continue
+                    close_tf = pd.to_numeric(df_1d["close"], errors="coerce").astype(float).dropna()
+
+                else:
+                    continue
+
+                out = compute_cross(close_tf)
+                if not out:
+                    continue
+
+                if not should_process_new_bar(state, key, tf, out["bar_time"]):
+                    continue
+
+                if out["crossed_up"] and can_alert(state, key, tf, tf_cfg["cooldown_hours"], now_ts):
+                    tf_msgs.append(
+                        f"- {tf.upper()}: RSI {out['rsi']:.2f} cắt lên EMA {out['ema']:.2f} (bar {out['bar_time']})"
+                    )
+
+            except Exception:
+                continue
 
         # Gửi tín hiệu (nếu có)
         if tf_msgs:
             hits += 1
+
+            # Choose a yahoo link if available
+            used_link_sym = used_sym_1h or used_sym_1d or (yahoo_try[0] if yahoo_try else "")
+            yahoo_link = f"https://finance.yahoo.com/quote/{used_link_sym}" if used_link_sym else ""
+
+            tv_link = f"https://www.tradingview.com/symbols/{ticker}/"  # generic TV symbol page
+
             msg = (
                 f"📈 RSI Cross UP (multi-TF)\n"
-                f"{exchange}:{ticker} ({market})\n"
+                f"{label} ({market})\n"
                 + "\n".join(tf_msgs) + "\n"
-                f"https://finance.yahoo.com/quote/{yahoo_sym}"
+                + (yahoo_link + "\n" if yahoo_link else "")
+                + tv_link
             )
             send_telegram(msg, disable_preview=True)
 
@@ -360,7 +515,7 @@ def main():
     run_time_utc = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
     report_lines = [
         f"🧾 Scan report (hourly) @ {run_time_utc} UTC",
-        f"- Candidates: US={len(us_list)} | VN={len(vn_list)}",
+        f"- Candidates: US={len(us_list)} | VN={len(vn_list)} | EXTRA={len(extra_list)}",
         f"- Processed (Yahoo OK): {processed}",
         f"- Signals: {hits}",
         "",
@@ -369,6 +524,9 @@ def main():
         "",
         "🇻🇳 VN list (top):",
         ", ".join(vn_list[:REPORT_TOP_N_VN]) if vn_list else "(none)",
+        "",
+        "🧩 EXTRA symbols:",
+        ", ".join(extra_list) if extra_list else "(none)",
     ]
     send_telegram_chunked("\n".join(report_lines))
 
@@ -380,10 +538,8 @@ if __name__ == "__main__":
     try:
         main()
     except Exception:
-        # tuyệt đối không làm job chết vì 1 lỗi bất ngờ
         err = traceback.format_exc()
         print("Fatal error:\n", err)
-        # vẫn cố gửi 1 tin để bạn biết có lỗi
         try:
             send_telegram_chunked("❌ Fatal error in scan.py:\n" + err[:3000])
         except Exception:
