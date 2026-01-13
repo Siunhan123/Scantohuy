@@ -23,9 +23,9 @@ SLEEP_BETWEEN_SYMBOLS = 0.5  # seconds
 
 # Timeframes scanned
 TIMEFRAMES = [
-    {"tf": "1h", "cooldown_hours": 6},
-    {"tf": "4h", "cooldown_hours": 12},
-    {"tf": "1d", "cooldown_hours": 48},
+    {"tf": "1h", "cooldown_hours": 1},
+    {"tf": "4h", "cooldown_hours": 4},
+    {"tf": "1d", "cooldown_hours": 24},
 ]
 
 # Range (more history => RSI/EMA match better)
