@@ -14,7 +14,7 @@ STATE_FILE = "state.json"
 
 # ====== SETTINGS ======
 RSI_LEN = 14
-EMA_LEN = 9
+EMA_LEN = 8
 
 MAX_CANDIDATES_US = 40
 MAX_CANDIDATES_VN = 40
@@ -149,7 +149,7 @@ def get_candidates_tradingview() -> Tuple[List[Dict[str, Any]], List[Dict[str, A
 
     # VN strict
     vn_df = (Query()
-             .set_markets("global")
+             .set_markets("vietnam")
              .select("name", "exchange", "close", "volume")
              .where(C("exchange").isin(["HOSE", "HNX", "UPCOM"]))
              .where(C("close") > 1000)
