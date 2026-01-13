@@ -29,8 +29,8 @@ TIMEFRAMES = [
 ]
 
 # Range (more history => RSI/EMA match better)
-RANGE_1H = "180d"  # You can set "730d" if you want max warmup (heavier)
-RANGE_1D = "5y"
+RANGE_1H = "60d"  # You can set "730d" if you want max warmup (heavier)
+RANGE_1D = "3y"
 
 # Match TradingView "Extended hours" toggle:
 # - If you use TradingView with Extended Hours OFF for stocks, set False.
